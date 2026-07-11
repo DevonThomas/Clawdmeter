@@ -6,6 +6,15 @@ It runs on a [Waveshare ESP32-S3-Touch-AMOLED-2.16](https://www.waveshare.com/es
 busier when your usage rate climbs. The two side buttons send Space and
 Shift+Tab over BLE HID for Claude Code's voice mode and mode-toggle shortcuts.
 
+> **This is a fork.** The upstream project — firmware, the cross-platform usage
+> daemon, and every board port — is by [@HermannBjorgvin](https://github.com/HermannBjorgvin)
+> and contributors ([original repo](https://github.com/HermannBjorgvin/Clawdmeter)).
+> This fork adds a **native macOS menu bar app** on top of the existing daemon;
+> that addition ([`daemon/clawdmeter_menubar.py`](daemon/clawdmeter_menubar.py) +
+> [`install-mac-app.sh`](install-mac-app.sh)) is by
+> [Devon Thomas](https://github.com/DevonThomas). Nothing in the upstream firmware
+> or daemon was changed. See [macOS menu bar app](#macos-menu-bar-app).
+
 |              Usage meter              |              Clawd animation screen              |
 | :-----------------------------------: | :----------------------------------------------: |
 | ![Usage meter](assets/demo.jpeg) | ![Clawd animation screen](assets/demo.gif) |
@@ -80,6 +89,60 @@ tail -F ~/Library/Logs/claude-usage-daemon.out.log                          # li
 launchctl unload ~/Library/LaunchAgents/com.user.claude-usage-daemon.plist  # stop
 launchctl load -w ~/Library/LaunchAgents/com.user.claude-usage-daemon.plist # start
 ```
+
+## macOS menu bar app
+
+> **Fork addition** by [Devon Thomas](https://github.com/DevonThomas). This sits on
+> top of the macOS daemon above — instead of a silent LaunchAgent you get a Clawd
+> icon in the menu bar that you launch from Applications and can quit anytime.
+
+A Clawd icon sits in your menu bar with usage at a glance — ![menu bar chip](screenshots/menubar-title.png) — and the dropdown has the full breakdown, including the **Menu Bar Shows** submenu for choosing what the icon displays:
+
+![Clawdmeter menu bar app](screenshots/menubar-app.png)
+
+`Clawdmeter.app` is a small [rumps](https://github.com/jaredks/rumps) app that
+spawns the same `claude_usage_daemon.py` as a child — the daemon itself is
+unchanged — and surfaces its status live. It shows up in Applications/Spotlight,
+has no Dock icon, and replaces the silent LaunchAgent.
+
+### Install
+
+Run the daemon installer once (it sets up the Python venv), then the app installer:
+
+```bash
+./install-mac.sh        # daemon venv + deps (skip if you already ran it)
+./install-mac-app.sh    # builds Clawdmeter.app → /Applications, retires the LaunchAgent
+```
+
+Then launch it from Spotlight/Applications (or `open -a Clawdmeter`) and pair the
+board as [above](#pair-the-device).
+
+### Features
+
+- **Configurable menu bar title** — via **Menu Bar Shows**, pick what the icon
+  displays: session %, weekly %, session-reset countdown, burn rate (%/hr),
+  time-to-limit, or icon-only. The choice persists across launches.
+- **Burn-rate ETA** — projects when your 5-hour session will hit 100% from the
+  recent rate of climb, and tells you when the window will reset first
+  (`resets before limit ✓`). A ⚠️ appears only when the cap is imminent.
+- **Bluetooth impact tier** — a plain-language label (No noticeable impact / Low /
+  Higher than normal / Unusually high) from the measured send rate, so you can see
+  it isn't hogging Bluetooth (it sends ~70 B/min). ⚠️ flags abnormal traffic.
+- **At-a-glance status** — 🟢 connected / 🟡 connecting / 🔴 searching, plus session
+  and weekly usage, reset times, and account.
+- **Launch at Login** toggle, **Open Log**, and **Quit** (which stops the daemon
+  child cleanly).
+
+### Notes
+
+- **Apple-silicon native.** The installer builds the venv on an arm64-only Python,
+  so no Intel/Rosetta code is involved (and it self-heals a universal2 venv that
+  would otherwise trip the macOS "Intel app support ending" warning).
+- The `.app` is a thin launcher pointing at this repo — if you move the repo,
+  re-run `./install-mac-app.sh`.
+- **Uninstall:** quit from the menu, then `rm -rf /Applications/Clawdmeter.app`.
+  The LaunchAgent it retired is backed up at
+  `~/Library/LaunchAgents/com.user.claude-usage-daemon.plist.disabled`.
 
 ## Linux installation
 
@@ -294,6 +357,9 @@ See `tools/README.md` for details.
 
 ## Credits
 
+- Original project (firmware, daemon, board ports) by [@HermannBjorgvin](https://github.com/HermannBjorgvin) — [upstream repo](https://github.com/HermannBjorgvin/Clawdmeter).
+- macOS host daemon, LaunchAgent, and flash helper ported by [Chris Davidson (@lorddavidson)](https://github.com/lorddavidson).
+- macOS menu bar app (`Clawdmeter.app`) — fork addition by [Devon Thomas](https://github.com/DevonThomas).
 - Pixel-art Clawd animation by [@amaanbuilds](https://x.com/amaanbuilds), sourced from [claudepix.vercel.app](https://claudepix.vercel.app). Frame data and palettes scraped + converted by the tooling in `tools/`.
 - Lucide icon set ([lucide.dev](https://lucide.dev), MIT) for bluetooth and battery UI glyphs.
 - Anthropic brand fonts (Tiempos Text, Styrene B) — see licensing warning below.
