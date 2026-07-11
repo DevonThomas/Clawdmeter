@@ -244,6 +244,8 @@ class OnboardingController(NSObject):
         if daemon_ok:
             return True, f"Signed in as {who}."
         if getattr(self.app, "_auth_error", False):
+            if time.time() - getattr(self.app, "_last_refresh", 0) < 90:
+                return False, "Refreshing your Claude sign-in automatically — one moment…"
             return False, "Your Claude sign-in expired — sign in again to refresh it."
         if logged and method == "claude.ai":
             return True, f"Signed in as {who}."

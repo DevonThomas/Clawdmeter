@@ -218,6 +218,7 @@ class ClawdmeterApp(rumps.App):
         self._payload: dict | None = None
         self._last_update: float | None = None
         self._auth_error = False  # daemon got a 401 (token expired/invalid)
+        self._last_refresh = 0.0  # last auto token-refresh attempt (throttle)
         self._proc: subprocess.Popen | None = None
         self._started = False
         # BLE traffic accounting (bytes actually written to the board per poll).
@@ -436,8 +437,11 @@ class ClawdmeterApp(rumps.App):
                     f"({_human_bytes(self._bytes_total)} total)"
                 )
         elif self._connected and self._auth_error:
+            self._attempt_token_refresh()
+            refreshing = time.time() - self._last_refresh < 70
             self.title = " ⚠"
-            self.item_conn.title = "🔴 Claude sign-in expired — open Set Up"
+            self.item_conn.title = ("🟡 Refreshing Claude sign-in…" if refreshing
+                                    else "🔴 Claude sign-in expired — open Set Up")
             self.item_burn.title = "Burn rate: —"
             self.item_ble.title = "Bluetooth use: —"
         elif self._connected:
@@ -480,6 +484,37 @@ class ClawdmeterApp(rumps.App):
     def _mark_onboarded(self) -> None:
         self._onboarded = True
         self._save_settings()
+
+    def _attempt_token_refresh(self) -> None:
+        """Self-heal an expired token. Claude Code refreshes and re-persists the
+        stored OAuth token whenever it makes an authenticated call, so we just
+        nudge it with one minimal `claude -p` request (no MCP, cheapest model).
+        The daemon re-reads the refreshed token on its next poll. Throttled, and
+        run on a background thread. This delegates entirely to Claude Code's own
+        auth — no OAuth flow is reimplemented here. If the refresh token itself
+        has expired, this is a no-op and the user re-signs in via Set Up."""
+        now = time.time()
+        if now - self._last_refresh < 300:  # at most once every 5 min
+            return
+        self._last_refresh = now
+
+        def worker():
+            print(f"[{time.strftime('%H:%M:%S')}] Token expired — nudging Claude "
+                  f"Code to refresh it…", flush=True)
+            try:
+                subprocess.run(
+                    ["/bin/zsh", "-lic",
+                     "cd ~ && claude -p 'ok' --model haiku --strict-mcp-config "
+                     ">/dev/null 2>&1"],
+                    timeout=90,
+                )
+                print(f"[{time.strftime('%H:%M:%S')}] Refresh nudge done; daemon "
+                      f"retries on its next poll.", flush=True)
+            except Exception as e:
+                print(f"[{time.strftime('%H:%M:%S')}] Refresh nudge failed: {e}",
+                      flush=True)
+
+        threading.Thread(target=worker, name="clawd-refresh", daemon=True).start()
 
     def _set_title_mode(self, key: str) -> None:
         self._title_mode = key
