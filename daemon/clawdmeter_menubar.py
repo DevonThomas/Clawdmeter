@@ -163,8 +163,13 @@ class ClawdmeterApp(rumps.App):
         )
         self._app_path = os.environ.get("CLAWDMETER_APP", "")
 
-        # What the menu bar title shows (persisted across launches).
-        self._title_mode = self._load_settings().get("title_mode", "session")
+        # Persisted settings (menu bar title mode + whether onboarding is done).
+        _settings = self._load_settings()
+        self._title_mode = _settings.get("title_mode", "session")
+        self._onboarded = bool(_settings.get("onboarded", False))
+        self._ob = None          # onboarding controller (lazily created)
+        self._ob_shown = False   # first-run decision made this launch?
+        self._start_ts = time.time()
         self.item_mode = rumps.MenuItem("Menu Bar Shows")
         self._mode_items: dict[str, rumps.MenuItem] = {}
         for key, label in TITLE_MODES:
@@ -200,6 +205,7 @@ class ClawdmeterApp(rumps.App):
             self.item_ble,
             None,
             self.item_mode,
+            rumps.MenuItem("Set Up / Connection…", callback=self.open_onboarding),
             rumps.MenuItem("Open Log", callback=self.open_log),
             self.item_login,
             None,
@@ -211,6 +217,7 @@ class ClawdmeterApp(rumps.App):
         self._connected = False
         self._payload: dict | None = None
         self._last_update: float | None = None
+        self._auth_error = False  # daemon got a 401 (token expired/invalid)
         self._proc: subprocess.Popen | None = None
         self._started = False
         # BLE traffic accounting (bytes actually written to the board per poll).
@@ -269,6 +276,7 @@ class ClawdmeterApp(rumps.App):
                 self._payload = json.loads(raw)
                 self._last_update = time.time()
                 self._connected = True
+                self._auth_error = False  # a successful poll clears the flag
                 # Exact bytes written to the GATT characteristic this poll.
                 self._bytes_last = len(raw.encode())
                 self._bytes_total += self._bytes_last
@@ -294,6 +302,8 @@ class ClawdmeterApp(rumps.App):
                 pass
         elif msg == "Connected":
             self._connected = True
+        elif msg.startswith("API HTTP 401") or msg.startswith("API HTTP 403"):
+            self._auth_error = True
         elif any(msg.startswith(x) for x in _DISCONNECT_MARKERS):
             self._connected = False
 
@@ -387,6 +397,16 @@ class ClawdmeterApp(rumps.App):
             self._started = True
             self._start_daemon()
 
+        # First-run onboarding: after giving the daemon a few seconds to connect,
+        # show the setup window — unless everything already works (don't nag
+        # people who are already set up; just mark them onboarded).
+        if not self._onboarded and not self._ob_shown and time.time() - self._start_ts > 8:
+            self._ob_shown = True
+            if self._connected and self._payload is not None:
+                self._mark_onboarded()
+            else:
+                self.open_onboarding(None)
+
         p = self._payload
         if self._connected and p:
             s, w = p.get("s", 0), p.get("w", 0)
@@ -415,6 +435,11 @@ class ClawdmeterApp(rumps.App):
                     f"Bluetooth:  {prefix}{label} · ~{_human_bytes(int(rate))}/min "
                     f"({_human_bytes(self._bytes_total)} total)"
                 )
+        elif self._connected and self._auth_error:
+            self.title = " ⚠"
+            self.item_conn.title = "🔴 Claude sign-in expired — open Set Up"
+            self.item_burn.title = "Burn rate: —"
+            self.item_ble.title = "Bluetooth use: —"
         elif self._connected:
             self.title = " …"
             self.item_conn.title = "🟡 Connected — waiting for data…"
@@ -437,9 +462,24 @@ class ClawdmeterApp(rumps.App):
     def _save_settings(self) -> None:
         try:
             SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            SETTINGS_FILE.write_text(json.dumps({"title_mode": self._title_mode}))
+            SETTINGS_FILE.write_text(json.dumps(
+                {"title_mode": self._title_mode, "onboarded": self._onboarded}))
         except OSError:
             pass
+
+    def open_onboarding(self, _) -> None:
+        try:
+            if self._ob is None:
+                from clawdmeter_onboarding import OnboardingController
+                self._ob = OnboardingController.alloc().initWithApp_(self)
+            self._ob.show()
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
+    def _mark_onboarded(self) -> None:
+        self._onboarded = True
+        self._save_settings()
 
     def _set_title_mode(self, key: str) -> None:
         self._title_mode = key
