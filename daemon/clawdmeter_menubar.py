@@ -13,6 +13,7 @@ Environment (set by the .app launcher stub):
   CLAWDMETER_APP   absolute path to Clawdmeter.app (for the Launch-at-Login item)
 """
 
+import collections
 import fcntl
 import json
 import os
@@ -28,6 +29,11 @@ import rumps
 
 HERE = Path(__file__).resolve().parent
 DAEMON_PY = HERE / "claude_usage_daemon.py"
+# Burn-rate ETA tuning.
+BURN_WINDOW = 25 * 60      # seconds of session-% history used for the slope
+BURN_MIN_SPAN = 5 * 60     # need this much history before projecting
+BURN_IDLE_HR = 1.0         # below this %/hr we call usage "steady, not climbing"
+
 LOG_OUT = Path.home() / "Library" / "Logs" / "clawdmeter-app.log"
 LOCK_FILE = Path.home() / "Library" / "Application Support" / "Clawdmeter" / "app.lock"
 LOGIN_PLIST = Path.home() / "Library" / "LaunchAgents" / "com.user.clawdmeter.plist"
@@ -84,6 +90,23 @@ def _human_bytes(n: int) -> str:
     return f"{n / 1024 / 1024:.1f} MB"
 
 
+def _ble_tier(rate_per_min: float) -> tuple[str, bool]:
+    """Map a measured send rate (bytes/min) to a lay-friendly impact tier.
+
+    Returns (label, is_warning). Calibrated for Clawdmeter, which normally
+    sends ~70 B/min — so anything past "Low" means it's behaving abnormally
+    (e.g. a reconnect/write loop) and is worth flagging, long before it could
+    actually affect other Bluetooth devices.
+    """
+    if rate_per_min < 2_048:            # < 2 KB/min  (normal is ~70 B/min)
+        return ("No noticeable impact", False)
+    if rate_per_min < 51_200:           # < 50 KB/min
+        return ("Low impact", False)
+    if rate_per_min < 512_000:          # < 500 KB/min
+        return ("Higher than normal", True)
+    return ("Unusually high — possible issue", True)
+
+
 def _acct_label(payload: dict) -> str:
     return {"pro": "Pro / Max", "ent": "Enterprise"}.get(
         payload.get("acct"), str(payload.get("acct", "—"))
@@ -129,6 +152,7 @@ class ClawdmeterApp(rumps.App):
         self.item_conn = rumps.MenuItem("Starting…", callback=self._noop)
         self.item_session = rumps.MenuItem("Session usage: —")
         self.item_session_reset = rumps.MenuItem("Session resets: —")
+        self.item_burn = rumps.MenuItem("Burn rate: —")
         self.item_weekly = rumps.MenuItem("Weekly usage: —")
         self.item_weekly_reset = rumps.MenuItem("Weekly resets: —")
         self.item_account = rumps.MenuItem("Account: —")
@@ -140,6 +164,7 @@ class ClawdmeterApp(rumps.App):
             None,
             self.item_session,
             self.item_session_reset,
+            self.item_burn,
             self.item_weekly,
             self.item_weekly_reset,
             self.item_account,
@@ -163,6 +188,10 @@ class ClawdmeterApp(rumps.App):
         self._bytes_last = 0
         self._bytes_total = 0
         self._poll_count = 0
+        self._first_write: float | None = None
+        self._writes: "collections.deque[tuple[float, int]]" = collections.deque()
+        # Session-% samples (wall_time, pct) for the burn-rate projection.
+        self._usage: "collections.deque[tuple[float, float]]" = collections.deque()
 
         # rumps.Timer fires on the main thread — the only safe place to touch UI.
         self._timer = rumps.Timer(self._tick, 2)
@@ -215,6 +244,23 @@ class ClawdmeterApp(rumps.App):
                 self._bytes_last = len(raw.encode())
                 self._bytes_total += self._bytes_last
                 self._poll_count += 1
+                now = time.time()
+                if self._first_write is None:
+                    self._first_write = now
+                self._writes.append((now, self._bytes_last))
+                cutoff = now - 300  # keep a rolling 5-minute window
+                while self._writes and self._writes[0][0] < cutoff:
+                    self._writes.popleft()
+                # Session-% sample for burn rate. A drop means the 5h window
+                # just reset — start a fresh trend so we don't project on it.
+                s_val = self._payload.get("s")
+                if isinstance(s_val, (int, float)):
+                    if self._usage and s_val < self._usage[-1][1] - 2:
+                        self._usage.clear()
+                    self._usage.append((now, float(s_val)))
+                    ucut = now - BURN_WINDOW
+                    while self._usage and self._usage[0][0] < ucut:
+                        self._usage.popleft()
             except json.JSONDecodeError:
                 pass
         elif msg == "Connected":
@@ -225,6 +271,50 @@ class ClawdmeterApp(rumps.App):
     # ---- main thread UI --------------------------------------------------
     def _noop(self, _) -> None:
         """No-op so info rows render as enabled (non-gray) text."""
+
+    def _ble_rate_per_min(self) -> float | None:
+        """Measured send rate (bytes/min) over the rolling window.
+
+        None until there's ~a minute of history — too early to characterize.
+        """
+        if self._first_write is None or not self._writes:
+            return None
+        now = time.time()
+        elapsed = now - self._first_write
+        if elapsed < 60:
+            return None
+        window_secs = min(elapsed, 300.0)
+        window_bytes = sum(b for _, b in self._writes)
+        return window_bytes / (window_secs / 60.0)
+
+    def _burn_text(self, payload: dict) -> str:
+        """Human 'burn rate' line: how fast session % is climbing and, if it's
+        headed for the cap before the window resets, roughly when.
+
+        Least-squares slope over the recent window (robust to bursty polling).
+        Key insight: if you'll reset before hitting 100%, that's good news."""
+        cur = payload.get("s", 0) or 0
+        if cur >= 100:
+            return "Burn rate:  at session limit"
+        pts = list(self._usage)
+        if len(pts) < 2 or (pts[-1][0] - pts[0][0]) < BURN_MIN_SPAN:
+            return "Burn rate:  measuring…"
+        n = len(pts)
+        mt = sum(t for t, _ in pts) / n
+        ms = sum(s for _, s in pts) / n
+        den = sum((t - mt) ** 2 for t, _ in pts)
+        if den == 0:
+            return "Burn rate:  measuring…"
+        per_min = (sum((t - mt) * (s - ms) for t, s in pts) / den) * 60.0  # %/min
+        per_hr = per_min * 60.0
+        if per_hr < BURN_IDLE_HR:
+            return "Burn rate:  steady — not climbing"
+        eta_min = (100.0 - cur) / per_min
+        sr = payload.get("sr")
+        if isinstance(sr, (int, float)) and sr > 0 and eta_min > sr:
+            return f"Burn rate:  ~{per_hr:.0f}%/hr · resets before limit ✓"
+        warn = "⚠️ " if eta_min <= 30 else ""
+        return f"Burn rate:  {warn}~{per_hr:.0f}%/hr · limit in ~{_fmt_reset(int(round(eta_min)))}"
 
     def _tick(self, _timer) -> None:
         # Spawn the daemon on the first tick — the status-bar item is guaranteed
@@ -240,24 +330,36 @@ class ClawdmeterApp(rumps.App):
             self.item_conn.title = "🟢 Connected to Clawdmeter"
             self.item_session.title = f"Session usage:  {s}%"
             self.item_session_reset.title = f"Session resets in:  {_fmt_reset(p.get('sr'))}"
+            self.item_burn.title = self._burn_text(p)
             self.item_weekly.title = f"Weekly usage:  {w}%"
             self.item_weekly_reset.title = f"Weekly resets in:  {_fmt_reset(p.get('wr'))}"
             self.item_account.title = f"Account:  {_acct_label(p)}  ({p.get('st', '—')})"
             when = time.strftime("%-I:%M:%S %p", time.localtime(self._last_update))
             self.item_updated.title = f"Last update:  {when}"
-            # ~60 B once per minute — show per-minute rate + session total so it's
-            # obvious the Bluetooth load is tiny (≈1 B/s; nothing else notices).
-            self.item_ble.title = (
-                f"Bluetooth use:  ~{self._bytes_last} B/min · "
-                f"{_human_bytes(self._bytes_total)} this session"
-            )
+            # Plain-language impact tier + the raw rate for the curious. Normal
+            # Clawdmeter (~70 B/min) reads "No noticeable impact"; a ⚠️ appears
+            # only if it ever climbs into abnormal territory.
+            rate = self._ble_rate_per_min()
+            if rate is None:
+                self.item_ble.title = (
+                    f"Bluetooth:  measuring… · {_human_bytes(self._bytes_total)} so far"
+                )
+            else:
+                label, warn = _ble_tier(rate)
+                prefix = "⚠️ " if warn else ""
+                self.item_ble.title = (
+                    f"Bluetooth:  {prefix}{label} · ~{_human_bytes(int(rate))}/min "
+                    f"({_human_bytes(self._bytes_total)} total)"
+                )
         elif self._connected:
             self.title = " …"
             self.item_conn.title = "🟡 Connected — waiting for data…"
+            self.item_burn.title = "Burn rate: —"
             self.item_ble.title = "Bluetooth use: —"
         else:
             self.title = " ⚠"
             self.item_conn.title = "🔴 Searching for Clawdmeter…"
+            self.item_burn.title = "Burn rate: —"
             self.item_ble.title = "Bluetooth use: —"
         self.item_login.state = 1 if LOGIN_PLIST.exists() else 0
 
