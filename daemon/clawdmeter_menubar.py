@@ -37,6 +37,19 @@ BURN_IDLE_HR = 1.0         # below this %/hr we call usage "steady, not climbing
 LOG_OUT = Path.home() / "Library" / "Logs" / "clawdmeter-app.log"
 LOCK_FILE = Path.home() / "Library" / "Application Support" / "Clawdmeter" / "app.lock"
 LOGIN_PLIST = Path.home() / "Library" / "LaunchAgents" / "com.user.clawdmeter.plist"
+SETTINGS_FILE = (
+    Path.home() / "Library" / "Application Support" / "Clawdmeter" / "settings.json"
+)
+
+# What the menu bar title can show. (key, menu label); order = menu order.
+TITLE_MODES = [
+    ("session", "Session usage %"),
+    ("weekly", "Weekly usage %"),
+    ("session_reset", "Session reset countdown"),
+    ("burn", "Burn rate (%/hr)"),
+    ("eta", "Time to session limit"),
+    ("icon", "Icon only"),
+]
 
 _MSG_RE = re.compile(r"^\[\d\d:\d\d:\d\d\]\s+(.*)$")
 _DISCONNECT_MARKERS = (
@@ -107,6 +120,11 @@ def _ble_tier(rate_per_min: float) -> tuple[str, bool]:
     return ("Unusually high — possible issue", True)
 
 
+def _fmt_compact(mins) -> str:
+    """Space-free reset time for the tight menu bar title (e.g. '1h23m')."""
+    return _fmt_reset(mins).replace(" ", "")
+
+
 def _acct_label(payload: dict) -> str:
     return {"pro": "Pro / Max", "ent": "Enterprise"}.get(
         payload.get("acct"), str(payload.get("acct", "—"))
@@ -145,6 +163,16 @@ class ClawdmeterApp(rumps.App):
         )
         self._app_path = os.environ.get("CLAWDMETER_APP", "")
 
+        # What the menu bar title shows (persisted across launches).
+        self._title_mode = self._load_settings().get("title_mode", "session")
+        self.item_mode = rumps.MenuItem("Menu Bar Shows")
+        self._mode_items: dict[str, rumps.MenuItem] = {}
+        for key, label in TITLE_MODES:
+            mi = rumps.MenuItem(label, callback=lambda s, k=key: self._set_title_mode(k))
+            mi.state = 1 if key == self._title_mode else 0
+            self._mode_items[key] = mi
+            self.item_mode.add(mi)
+
         # The status line carries a no-op callback so macOS renders it in normal
         # (enabled) text — it needs to read clearly as "running", not disabled.
         # The data rows below are read-only info with nothing to click, so leave
@@ -171,6 +199,7 @@ class ClawdmeterApp(rumps.App):
             self.item_updated,
             self.item_ble,
             None,
+            self.item_mode,
             rumps.MenuItem("Open Log", callback=self.open_log),
             self.item_login,
             None,
@@ -287,34 +316,69 @@ class ClawdmeterApp(rumps.App):
         window_bytes = sum(b for _, b in self._writes)
         return window_bytes / (window_secs / 60.0)
 
-    def _burn_text(self, payload: dict) -> str:
-        """Human 'burn rate' line: how fast session % is climbing and, if it's
-        headed for the cap before the window resets, roughly when.
+    def _burn_info(self, payload: dict) -> tuple[str, float, int | None]:
+        """(status, per_hr, eta_min) for the session burn rate.
 
-        Least-squares slope over the recent window (robust to bursty polling).
-        Key insight: if you'll reset before hitting 100%, that's good news."""
+        status ∈ measuring | steady | limit | reset_first | climbing. Slope is a
+        least-squares fit over the recent window (robust to bursty polling)."""
         cur = payload.get("s", 0) or 0
         if cur >= 100:
-            return "Burn rate:  at session limit"
+            return ("limit", 0.0, 0)
         pts = list(self._usage)
         if len(pts) < 2 or (pts[-1][0] - pts[0][0]) < BURN_MIN_SPAN:
-            return "Burn rate:  measuring…"
+            return ("measuring", 0.0, None)
         n = len(pts)
         mt = sum(t for t, _ in pts) / n
         ms = sum(s for _, s in pts) / n
         den = sum((t - mt) ** 2 for t, _ in pts)
         if den == 0:
-            return "Burn rate:  measuring…"
+            return ("measuring", 0.0, None)
         per_min = (sum((t - mt) * (s - ms) for t, s in pts) / den) * 60.0  # %/min
         per_hr = per_min * 60.0
         if per_hr < BURN_IDLE_HR:
-            return "Burn rate:  steady — not climbing"
-        eta_min = (100.0 - cur) / per_min
+            return ("steady", per_hr, None)
+        eta_min = int(round((100.0 - cur) / per_min))
         sr = payload.get("sr")
         if isinstance(sr, (int, float)) and sr > 0 and eta_min > sr:
+            return ("reset_first", per_hr, eta_min)
+        return ("climbing", per_hr, eta_min)
+
+    def _burn_text(self, payload: dict) -> str:
+        """The 'Burn rate' dropdown row. Key insight: if you'll reset before
+        hitting 100%, that's good news, not a countdown."""
+        status, per_hr, eta_min = self._burn_info(payload)
+        if status == "limit":
+            return "Burn rate:  at session limit"
+        if status == "measuring":
+            return "Burn rate:  measuring…"
+        if status == "steady":
+            return "Burn rate:  steady — not climbing"
+        if status == "reset_first":
             return f"Burn rate:  ~{per_hr:.0f}%/hr · resets before limit ✓"
-        warn = "⚠️ " if eta_min <= 30 else ""
-        return f"Burn rate:  {warn}~{per_hr:.0f}%/hr · limit in ~{_fmt_reset(int(round(eta_min)))}"
+        warn = "⚠️ " if eta_min is not None and eta_min <= 30 else ""
+        return f"Burn rate:  {warn}~{per_hr:.0f}%/hr · limit in ~{_fmt_reset(eta_min)}"
+
+    def _title_for(self, p: dict) -> str:
+        """The menu bar title text for the user's chosen mode (compact)."""
+        mode = self._title_mode
+        if mode == "icon":
+            return ""
+        if mode == "weekly":
+            return f" {p.get('w', 0)}% w"
+        if mode == "session_reset":
+            return " " + _fmt_compact(p.get("sr"))
+        if mode in ("burn", "eta"):
+            status, per_hr, eta_min = self._burn_info(p)
+            if status == "measuring":
+                return " …"
+            if status == "limit":
+                return " max"
+            if mode == "burn":
+                return " 0%/h" if status == "steady" else f" {per_hr:.0f}%/h"
+            if status in ("steady", "reset_first"):
+                return " safe"
+            return " " + _fmt_compact(eta_min)
+        return f" {p.get('s', 0)}%"  # default: session usage %
 
     def _tick(self, _timer) -> None:
         # Spawn the daemon on the first tick — the status-bar item is guaranteed
@@ -326,7 +390,7 @@ class ClawdmeterApp(rumps.App):
         p = self._payload
         if self._connected and p:
             s, w = p.get("s", 0), p.get("w", 0)
-            self.title = f" {s}%"
+            self.title = self._title_for(p)
             self.item_conn.title = "🟢 Connected to Clawdmeter"
             self.item_session.title = f"Session usage:  {s}%"
             self.item_session_reset.title = f"Session resets in:  {_fmt_reset(p.get('sr'))}"
@@ -363,7 +427,28 @@ class ClawdmeterApp(rumps.App):
             self.item_ble.title = "Bluetooth use: —"
         self.item_login.state = 1 if LOGIN_PLIST.exists() else 0
 
-    # ---- menu callbacks --------------------------------------------------
+    # ---- settings + menu callbacks --------------------------------------
+    def _load_settings(self) -> dict:
+        try:
+            return json.loads(SETTINGS_FILE.read_text())
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _save_settings(self) -> None:
+        try:
+            SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            SETTINGS_FILE.write_text(json.dumps({"title_mode": self._title_mode}))
+        except OSError:
+            pass
+
+    def _set_title_mode(self, key: str) -> None:
+        self._title_mode = key
+        for k, mi in self._mode_items.items():
+            mi.state = 1 if k == key else 0
+        self._save_settings()
+        if self._connected and self._payload:  # reflect the change immediately
+            self.title = self._title_for(self._payload)
+
     def open_log(self, _) -> None:
         subprocess.run(["open", str(LOG_OUT)], check=False)
 
