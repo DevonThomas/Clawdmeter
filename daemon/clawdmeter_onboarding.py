@@ -29,6 +29,10 @@ from AppKit import (
     NSApplicationActivationPolicyRegular,
     NSBackingStoreBuffered,
     NSMakeRect,
+    NSView,
+    NSViewHeightSizable,
+    NSViewMinYMargin,
+    NSViewWidthSizable,
     NSWindow,
     NSWindowStyleMaskClosable,
     NSWindowStyleMaskFullSizeContentView,
@@ -51,6 +55,7 @@ HTML = r"""<!doctype html><html><head><meta charset="utf-8"><style>
   --card:#2b2b2e; --done:#32d15b;
 }}
 *{box-sizing:border-box}
+img{-webkit-user-drag:none;user-drag:none;pointer-events:none}
 html,body{margin:0;height:100%}
 body{font:14px/1.4 -apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;
   background:var(--bg);color:var(--fg);-webkit-user-select:none;cursor:default;
@@ -96,7 +101,7 @@ body{font:14px/1.4 -apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;
 .done-btn.primary:hover{background:var(--accent-d)}
 </style></head><body>
 <div class="header">
-  <img class="logo" src="__LOGO__">
+  <img class="logo" draggable="false" src="__LOGO__">
   <div class="title">Set up Clawdmeter</div>
   <div class="subtitle">Three quick steps to get usage on your board.</div>
 </div>
@@ -170,6 +175,22 @@ def _claude_status_blocking() -> dict:
     return {}
 
 
+class DragView(NSView):
+    """Transparent strip over the header. A WKWebView swallows mouse events so
+    the window isn't movable by its background; this native view sits on top and
+    explicitly drives the window drag from its own mouse-down."""
+    def mouseDown_(self, event):
+        w = self.window()
+        if w is not None:
+            w.performWindowDragWithEvent_(event)
+
+    def acceptsFirstMouse_(self, event):
+        return True
+
+    def mouseDownCanMoveWindow(self):
+        return True
+
+
 class OnboardingController(NSObject):
     def initWithApp_(self, app):
         self = objc.super(OnboardingController, self).init()
@@ -206,12 +227,21 @@ class OnboardingController(NSObject):
         cfg.userContentController().addScriptMessageHandler_name_(self, "clawd")
         wv = WKWebView.alloc().initWithFrame_configuration_(rect, cfg)
         wv.setNavigationDelegate_(self)
+        wv.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
         try:
             wv.setValue_forKey_(False, "drawsBackground")  # let CSS bg show
         except Exception:
             pass
         wv.loadHTMLString_baseURL_(HTML.replace("__LOGO__", _logo_data_uri()), None)
-        win.setContentView_(wv)
+
+        # webview + a transparent drag strip over the header (so the window can
+        # be moved by dragging the top; also stops the logo from being dragged).
+        container = NSView.alloc().initWithFrame_(rect)
+        container.addSubview_(wv)
+        drag = DragView.alloc().initWithFrame_(NSMakeRect(0, H - 158, W, 158))
+        drag.setAutoresizingMask_(NSViewWidthSizable | NSViewMinYMargin)
+        container.addSubview_(drag)
+        win.setContentView_(container)
         self.window, self.webview = win, wv
 
     # ---- lifecycle -------------------------------------------------------
