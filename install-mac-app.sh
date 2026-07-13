@@ -55,7 +55,8 @@ if ! venv_is_clean_native; then
     "$PY" -m venv "$VENV"
 fi
 "$VENV/bin/pip" install --quiet --upgrade pip
-"$VENV/bin/pip" install --quiet "rumps>=0.4" "Pillow>=10" "bleak>=0.22" "httpx>=0.27"
+"$VENV/bin/pip" install --quiet "rumps>=0.4" "Pillow>=10" "bleak>=0.22" \
+    "httpx>=0.27" "pyobjc-framework-WebKit>=10"
 
 # 2. Build the app icon (.icns) + menu-bar PNG from the Clawd mascot asset.
 echo "[2/5] Generating icon from assets/logo_80.png..."
