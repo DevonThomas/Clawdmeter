@@ -25,7 +25,10 @@ import threading
 import time
 from pathlib import Path
 
+import objc
 import rumps
+from AppKit import NSWorkspace, NSWorkspaceDidWakeNotification
+from Foundation import NSObject
 
 HERE = Path(__file__).resolve().parent
 DAEMON_PY = HERE / "claude_usage_daemon.py"
@@ -150,6 +153,24 @@ def _single_instance_or_exit():
     return fh
 
 
+class _WakeObserver(NSObject):
+    """Forwards macOS wake-from-sleep notifications to the app so it can
+    reconnect the board (the BLE link goes stale silently across sleep)."""
+    def initWithApp_(self, app):
+        self = objc.super(_WakeObserver, self).init()
+        if self is None:
+            return None
+        self._app = app
+        return self
+
+    def onWake_(self, note):
+        try:
+            self._app._on_wake()
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
+
 class ClawdmeterApp(rumps.App):
     def __init__(self) -> None:
         icon = os.environ.get("CLAWDMETER_ICON")
@@ -219,6 +240,7 @@ class ClawdmeterApp(rumps.App):
         self._last_update: float | None = None
         self._auth_error = False  # daemon got a 401 (token expired/invalid)
         self._last_refresh = 0.0  # last auto token-refresh attempt (throttle)
+        self._last_wake = 0.0     # last wake-from-sleep reconnect (throttle)
         self._proc: subprocess.Popen | None = None
         self._started = False
         # BLE traffic accounting (bytes actually written to the board per poll).
@@ -233,6 +255,13 @@ class ClawdmeterApp(rumps.App):
         # rumps.Timer fires on the main thread — the only safe place to touch UI.
         self._timer = rumps.Timer(self._tick, 2)
         self._timer.start()
+
+        # Reconnect the board when the Mac wakes: across sleep the BLE link dies
+        # silently (fire-and-forget writes don't error, is_connected stays stale
+        # true), so the daemon keeps "sending" to nothing. Restart it on wake.
+        self._wake_observer = _WakeObserver.alloc().initWithApp_(self)
+        NSWorkspace.sharedWorkspace().notificationCenter().addObserver_selector_name_object_(
+            self._wake_observer, "onWake:", NSWorkspaceDidWakeNotification, None)
 
     # ---- child daemon + stdout reader (background thread) ----------------
     def _start_daemon(self) -> None:
@@ -515,6 +544,33 @@ class ClawdmeterApp(rumps.App):
                       flush=True)
 
         threading.Thread(target=worker, name="clawd-refresh", daemon=True).start()
+
+    def _on_wake(self) -> None:
+        """Mac woke from sleep — the BLE link is likely stale. Reconnect after a
+        short delay so Bluetooth has time to come back up. Throttled so a burst
+        of wake notifications only triggers one reconnect."""
+        now = time.time()
+        if now - self._last_wake < 10:
+            return
+        self._last_wake = now
+        print(f"[{time.strftime('%H:%M:%S')}] Woke from sleep — reconnecting to "
+              f"the board…", flush=True)
+        self._connected = False  # reflect reconnecting state until it's back
+        threading.Timer(3.0, self._restart_daemon).start()
+
+    def _restart_daemon(self) -> None:
+        """Stop the daemon child and start a fresh one (new BLE connection)."""
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.send_signal(signal.SIGTERM)
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self._start_daemon()
 
     def _set_title_mode(self, key: str) -> None:
         self._title_mode = key
