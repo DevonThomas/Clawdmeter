@@ -438,7 +438,19 @@ class ClawdmeterApp(rumps.App):
                 self.open_onboarding(None)
 
         p = self._payload
-        if self._connected and p:
+        if self._connected and self._auth_error:
+            # Check this BEFORE the show-data branch: after a sleep/expiry the
+            # daemon reconnects while _payload still holds pre-sleep data, and
+            # that stale payload would otherwise mask the 401 and skip the
+            # self-heal — which is exactly why it stayed on the placeholder.
+            self._attempt_token_refresh()
+            refreshing = time.time() - self._last_refresh < 70
+            self.title = " ⚠"
+            self.item_conn.title = ("🟡 Refreshing Claude sign-in…" if refreshing
+                                    else "🔴 Claude sign-in expired — open Set Up")
+            self.item_burn.title = "Burn rate: —"
+            self.item_ble.title = "Bluetooth use: —"
+        elif self._connected and p:
             s, w = p.get("s", 0), p.get("w", 0)
             self.title = self._title_for(p)
             self.item_conn.title = "🟢 Connected to Clawdmeter"
@@ -465,14 +477,6 @@ class ClawdmeterApp(rumps.App):
                     f"Bluetooth:  {prefix}{label} · ~{_human_bytes(int(rate))}/min "
                     f"({_human_bytes(self._bytes_total)} total)"
                 )
-        elif self._connected and self._auth_error:
-            self._attempt_token_refresh()
-            refreshing = time.time() - self._last_refresh < 70
-            self.title = " ⚠"
-            self.item_conn.title = ("🟡 Refreshing Claude sign-in…" if refreshing
-                                    else "🔴 Claude sign-in expired — open Set Up")
-            self.item_burn.title = "Burn rate: —"
-            self.item_ble.title = "Bluetooth use: —"
         elif self._connected:
             self.title = " …"
             self.item_conn.title = "🟡 Connected — waiting for data…"
@@ -523,7 +527,7 @@ class ClawdmeterApp(rumps.App):
         auth — no OAuth flow is reimplemented here. If the refresh token itself
         has expired, this is a no-op and the user re-signs in via Set Up."""
         now = time.time()
-        if now - self._last_refresh < 300:  # at most once every 5 min
+        if now - self._last_refresh < 90:  # retry ~every 90s if it keeps failing
             return
         self._last_refresh = now
 
@@ -556,6 +560,7 @@ class ClawdmeterApp(rumps.App):
         print(f"[{time.strftime('%H:%M:%S')}] Woke from sleep — reconnecting to "
               f"the board…", flush=True)
         self._connected = False  # reflect reconnecting state until it's back
+        self._payload = None      # drop pre-sleep data so it can't mask a 401
         threading.Timer(3.0, self._restart_daemon).start()
 
     def _restart_daemon(self) -> None:
